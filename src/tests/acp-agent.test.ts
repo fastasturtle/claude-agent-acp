@@ -40,12 +40,12 @@ import {
   createFastModeConfigOption,
   discoverCustomAgents,
   runPromptWithCancellation,
-  appendTitleContext,
   type AcpClient,
   type SDKMessageFilter,
   type SteerRequest,
   type StreamedToolInputCache,
 } from "../acp-agent.js";
+import { SessionTitles } from "../session-titles.js";
 import { Pushable } from "../utils.js";
 import {
   deleteSession,
@@ -55,8 +55,7 @@ import {
   SDKAssistantMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import { randomUUID } from "crypto";
-import { readFile } from "node:fs/promises";
-import { createRequire } from "node:module";
+import { mockSessionState, userEcho, wrapQuery } from "./session-doubles.js";
 import {
   GOAL_CONTROL_METHOD,
   goalUpdateFromPrompt,
@@ -83,19 +82,6 @@ import type {
   BetaWebFetchToolResultBlockParam,
   BetaCodeExecutionToolResultBlockParam,
 } from "@anthropic-ai/sdk/resources/beta.mjs";
-
-/** Build the replayed `user` message the SDK echoes back for a pushed prompt,
- *  used by mock generators to promote a turn to active. */
-function userEcho(u: any) {
-  return {
-    type: "user",
-    message: u.message,
-    parent_tool_use_id: null,
-    uuid: u.uuid,
-    session_id: "test-session",
-    isReplay: true,
-  };
-}
 
 /** A `system`/init frame advertising the msg_lifecycle_v1 capability, so the
  *  consumer latches `session.msgLifecycleV1` and cancel() routes orphan
@@ -130,55 +116,6 @@ const cancelledTurnUsage = {
   cachedWriteTokens: 0,
   totalTokens: 0,
 };
-
-/** Wrap a mock async generator with the `Query` methods the agent calls outside
- *  of iteration — `close()` (teardown/closeQueryStream), `interrupt()` (cancel),
- *  and `setModel()` — so a bare generator doesn't trip "x is not a function". */
-function wrapQuery(generator: AsyncGenerator<any>) {
-  return Object.assign(generator, {
-    interrupt: vi.fn(async () => {}),
-    close: vi.fn(),
-    setModel: vi.fn(async () => {}),
-  }) as any;
-}
-
-/** The common `Session` mock fields, with per-test overrides spread on top.
- *  Centralizes the boilerplate (usage accumulator, caches, controllers) so a new
- *  Session field is added in one place rather than every inline literal. */
-function mockSessionState(overrides: Record<string, any> = {}) {
-  return {
-    cancelled: false,
-    cwd: "/test",
-    sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
-    modes: { currentModeId: "default", availableModes: [] },
-    models: { currentModelId: "default", availableModels: [] },
-    modelInfos: [],
-    settingsManager: { dispose: vi.fn() },
-    accumulatedUsage: {
-      inputTokens: 0,
-      outputTokens: 0,
-      cachedReadTokens: 0,
-      cachedWriteTokens: 0,
-    },
-    configOptions: [],
-    agents: [],
-    currentAgent: "default",
-    abortController: new AbortController(),
-    emitRawSDKMessages: false,
-    forwardSubagentText: false,
-    contextWindowSize: 200000,
-    contextWindowAuthoritative: false,
-    providerCacheKey: "default",
-    taskState: new Map(),
-    toolUseCache: {},
-    emittedToolCalls: new Set(),
-    liveBackgroundTasks: new Map(),
-    emittedAssistantText: false,
-    owedTrailingIdles: 0,
-    messageIdToUuid: new Map(),
-    ...overrides,
-  } as any;
-}
 
 /** Install a mock session whose query is a caller-supplied async generator
  *  driven by the session's streaming input. Returns the input Pushable so the
@@ -1938,32 +1875,6 @@ describe("prompt conversion", () => {
         type: "text",
       },
     ]);
-  });
-});
-
-describe("session title generation", () => {
-  // Smoke test for the one undeclared SDK method this feature rests on:
-  // `generateSessionTitle` is on the runtime `Query` class but absent from
-  // `sdk.d.ts`, so nothing else would catch its removal. Method names survive
-  // bundling (only module-scope identifiers get mangled), so an SDK upgrade that
-  // renames or drops it fails here instead of silently degrading titles back to
-  // raw prompts. Runs unconditionally — it reads the shipped bundle and never
-  // spawns the CLI.
-  it("SDK still ships generateSessionTitle and its control subtype", async () => {
-    const sdkEntry = createRequire(import.meta.url).resolve("@anthropic-ai/claude-agent-sdk");
-    const bundle = await readFile(sdkEntry, "utf8");
-    expect({
-      method: bundle.includes("async generateSessionTitle("),
-      subtype: bundle.includes('subtype:"generate_session_title"'),
-    }).toEqual({ method: true, subtype: true });
-  });
-
-  it("keeps only the trailing title context", () => {
-    expect(appendTitleContext("abc", "def")).toBe("abcdef");
-    expect(appendTitleContext(undefined, "abc")).toBe("abc");
-    const overflowed = appendTitleContext("x".repeat(1000), "tail");
-    expect(overflowed).toHaveLength(1000);
-    expect(overflowed.endsWith("tail")).toBe(true);
   });
 });
 
@@ -3900,286 +3811,6 @@ describe("stop reason propagation", () => {
     expect(chunkTexts).toContain("between-turn background note");
   });
 
-  it("pushes a session_info_update when the SDK generates a title at turn-end", async () => {
-    const sessionUpdates: any[] = [];
-    const mockClient = {
-      sessionUpdate: async (u: any) => {
-        sessionUpdates.push(u);
-      },
-    } as unknown as AcpClient;
-    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
-
-    vi.mocked(getSessionInfo).mockResolvedValue({
-      sessionId: "test-session",
-      summary: "Fix the flaky title test",
-      lastModified: 1_700_000_000_000,
-    } as any);
-
-    const input = new Pushable<any>();
-    async function* messageGenerator() {
-      const iter = input[Symbol.asyncIterator]();
-      const { value: userMessage } = await iter.next();
-      yield userEcho(userMessage);
-      yield createResultMessage({ subtype: "success", stop_reason: "end_turn", is_error: false });
-      yield { type: "system", subtype: "session_state_changed", state: "idle" };
-    }
-
-    agent.sessions["test-session"] = mockSessionState({
-      query: wrapQuery(messageGenerator()),
-      input,
-    });
-
-    await agent.prompt({
-      sessionId: "test-session",
-      prompt: [{ type: "text", text: "test" }],
-    });
-    await agent.sessions["test-session"]?.consumer;
-
-    const titleUpdate = sessionUpdates.find(
-      (u) => u.update?.sessionUpdate === "session_info_update",
-    );
-    expect(titleUpdate?.update).toEqual({
-      sessionUpdate: "session_info_update",
-      title: "Fix the flaky title test",
-      updatedAt: new Date(1_700_000_000_000).toISOString(),
-    });
-    expect(getSessionInfo).toHaveBeenCalledWith("test-session", { dir: "/test" });
-  });
-
-  it("does not re-push session_info_update when the title is unchanged", async () => {
-    const sessionUpdates: any[] = [];
-    const mockClient = {
-      sessionUpdate: async (u: any) => {
-        sessionUpdates.push(u);
-      },
-    } as unknown as AcpClient;
-    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
-
-    vi.mocked(getSessionInfo).mockResolvedValue({
-      sessionId: "test-session",
-      summary: "Stable title",
-      lastModified: 1_700_000_000_000,
-    } as any);
-
-    const input = new Pushable<any>();
-    async function* messageGenerator() {
-      const iter = input[Symbol.asyncIterator]();
-      // Two turns, each ending in idle, but the title never changes.
-      for (let i = 0; i < 2; i++) {
-        const { value: userMessage } = await iter.next();
-        yield userEcho(userMessage);
-        yield createResultMessage({
-          subtype: "success",
-          stop_reason: "end_turn",
-          is_error: false,
-        });
-        yield { type: "system", subtype: "session_state_changed", state: "idle" };
-      }
-    }
-
-    agent.sessions["test-session"] = mockSessionState({
-      query: wrapQuery(messageGenerator()),
-      input,
-    });
-
-    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "one" }] });
-    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "two" }] });
-    await agent.sessions["test-session"]?.consumer;
-
-    const titleUpdates = sessionUpdates.filter(
-      (u) => u.update?.sessionUpdate === "session_info_update",
-    );
-    expect(titleUpdates).toHaveLength(1);
-  });
-
-  /** Collect every `session_info_update` an agent pushes. */
-  function titleRecorder() {
-    const updates: any[] = [];
-    const client = {
-      sessionUpdate: async (u: any) => {
-        if (u.update?.sessionUpdate === "session_info_update") updates.push(u.update);
-      },
-    } as unknown as AcpClient;
-    return { client, titles: () => updates.map((u) => u.title) };
-  }
-
-  /** `wrapQuery` plus the undeclared `generateSessionTitle` the real `Query`
-   *  exposes, so turn-end takes the generate branch. */
-  function wrapTitleQuery(generator: AsyncGenerator<any>, title: string | null) {
-    const generateSessionTitle = vi.fn(async (_d: string, _o?: { persist?: boolean }) => title);
-    return {
-      query: Object.assign(wrapQuery(generator), { generateSessionTitle }),
-      generateSessionTitle,
-    };
-  }
-
-  /** One turn: echo the pushed prompt, succeed, go idle. */
-  async function* oneTurn(input: Pushable<any>, turns = 1) {
-    const iter = input[Symbol.asyncIterator]();
-    for (let i = 0; i < turns; i++) {
-      const { value: userMessage } = await iter.next();
-      yield userEcho(userMessage);
-      yield createResultMessage({ subtype: "success", stop_reason: "end_turn", is_error: false });
-      yield { type: "system", subtype: "session_state_changed", state: "idle" };
-    }
-  }
-
-  const LONG_PROMPT = "Explain what the add function in hello.py does, in one sentence";
-
-  it("generates a title at turn-end instead of publishing the raw prompt", async () => {
-    const { client, titles } = titleRecorder();
-    const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
-
-    // What an SDK-driven session really looks like: nothing has written a title,
-    // so `summary` is just the opening prompt.
-    vi.mocked(getSessionInfo).mockResolvedValue({
-      sessionId: "test-session",
-      summary: LONG_PROMPT,
-      lastModified: 1_700_000_000_000,
-    } as any);
-
-    const input = new Pushable<any>();
-    const { query, generateSessionTitle } = wrapTitleQuery(
-      oneTurn(input),
-      "Explain add() in hello.py",
-    );
-    agent.sessions["test-session"] = mockSessionState({ query, input });
-
-    await agent.prompt({
-      sessionId: "test-session",
-      prompt: [{ type: "text", text: LONG_PROMPT }],
-    });
-    await agent.sessions["test-session"]?.consumer;
-    // Generation is fired off the turn-end path, so it lands after `idle`.
-    await vi.waitFor(() => {
-      expect(generateSessionTitle).toHaveBeenCalledTimes(1);
-    });
-
-    expect(generateSessionTitle).toHaveBeenCalledWith(LONG_PROMPT, { persist: true });
-    // The raw prompt was never published — only the generated title.
-    expect(titles()).toEqual(["Explain add() in hello.py"]);
-  });
-
-  it("adopts a stored title and never generates over it", async () => {
-    const { client, titles } = titleRecorder();
-    const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
-
-    // The SDK folds a `/rename` and an earlier generated title into the same
-    // field, so a non-empty `customTitle` means hands off.
-    vi.mocked(getSessionInfo).mockResolvedValue({
-      sessionId: "test-session",
-      summary: "Renamed by the user",
-      customTitle: "Renamed by the user",
-      lastModified: 1_700_000_000_000,
-    } as any);
-
-    const input = new Pushable<any>();
-    const { query, generateSessionTitle } = wrapTitleQuery(oneTurn(input), "Generated instead");
-    agent.sessions["test-session"] = mockSessionState({ query, input });
-
-    await agent.prompt({
-      sessionId: "test-session",
-      prompt: [{ type: "text", text: LONG_PROMPT }],
-    });
-    await agent.sessions["test-session"]?.consumer;
-
-    expect(generateSessionTitle).not.toHaveBeenCalled();
-    expect(titles()).toEqual(["Renamed by the user"]);
-  });
-
-  it("generates once per session, and a later turn can't fall back to the prompt", async () => {
-    const { client, titles } = titleRecorder();
-    const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
-
-    // `getSessionInfo` never reports the persisted title here, so the once-per-
-    // session latch is the only thing holding the second turn back.
-    vi.mocked(getSessionInfo).mockResolvedValue({
-      sessionId: "test-session",
-      summary: LONG_PROMPT,
-      lastModified: 1_700_000_000_000,
-    } as any);
-
-    const input = new Pushable<any>();
-    const { query, generateSessionTitle } = wrapTitleQuery(
-      oneTurn(input, 2),
-      "Explain add() in hello.py",
-    );
-    agent.sessions["test-session"] = mockSessionState({ query, input });
-
-    await agent.prompt({
-      sessionId: "test-session",
-      prompt: [{ type: "text", text: LONG_PROMPT }],
-    });
-    await vi.waitFor(() => {
-      expect(generateSessionTitle).toHaveBeenCalledTimes(1);
-    });
-    await agent.prompt({
-      sessionId: "test-session",
-      prompt: [{ type: "text", text: "And what is the capital of France?" }],
-    });
-    await agent.sessions["test-session"]?.consumer;
-
-    expect(generateSessionTitle).toHaveBeenCalledTimes(1);
-    expect(titles()).toEqual(["Explain add() in hello.py"]);
-  });
-
-  it("releases the latch when generation yields no title", async () => {
-    const { client, titles } = titleRecorder();
-    const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
-
-    vi.mocked(getSessionInfo).mockResolvedValue({
-      sessionId: "test-session",
-      summary: LONG_PROMPT,
-      lastModified: 1_700_000_000_000,
-    } as any);
-
-    const input = new Pushable<any>();
-    const { query, generateSessionTitle } = wrapTitleQuery(oneTurn(input, 2), null);
-    agent.sessions["test-session"] = mockSessionState({ query, input });
-
-    await agent.prompt({
-      sessionId: "test-session",
-      prompt: [{ type: "text", text: LONG_PROMPT }],
-    });
-    await vi.waitFor(() => {
-      expect(generateSessionTitle).toHaveBeenCalledTimes(1);
-    });
-    await agent.prompt({
-      sessionId: "test-session",
-      prompt: [{ type: "text", text: "And what is the capital of France?" }],
-    });
-    await agent.sessions["test-session"]?.consumer;
-    await vi.waitFor(() => {
-      expect(generateSessionTitle).toHaveBeenCalledTimes(2);
-    });
-
-    // Nothing generated, so the client still gets the summary fallback.
-    expect(titles()).toEqual([LONG_PROMPT]);
-  });
-
-  it("skips slash-command and bash openers when building the title context", async () => {
-    const { client } = titleRecorder();
-    const agent = new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
-
-    vi.mocked(getSessionInfo).mockResolvedValue({
-      sessionId: "test-session",
-      summary: "/compact",
-      lastModified: 1_700_000_000_000,
-    } as any);
-
-    const input = new Pushable<any>();
-    const { query, generateSessionTitle } = wrapTitleQuery(oneTurn(input), "Compact the session");
-    agent.sessions["test-session"] = mockSessionState({ query, input });
-
-    await agent.prompt({
-      sessionId: "test-session",
-      prompt: [{ type: "text", text: "/compact keep the design discussion" }],
-    });
-    await agent.sessions["test-session"]?.consumer;
-
-    expect(generateSessionTitle).not.toHaveBeenCalled();
-  });
-
   it("should throw internal error for success with is_error true and no max_tokens", async () => {
     const agent = createMockAgent();
     injectSession(agent, [
@@ -5495,6 +5126,7 @@ describe("session/close", () => {
       query: gen as any,
       input: new Pushable(),
       cancelled: false,
+      titles: new SessionTitles(agent, sessionId),
       cwd: "/test",
       sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
       modes: {
@@ -5594,6 +5226,7 @@ describe("session/delete", () => {
       query: gen as any,
       input: new Pushable(),
       cancelled: false,
+      titles: new SessionTitles(agent, sessionId),
       cwd: "/test",
       sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
       modes: { currentModeId: "default", availableModes: [] },
@@ -5701,6 +5334,7 @@ describe("getOrCreateSession param change detection", () => {
       query: gen as any,
       input: new Pushable(),
       cancelled: false,
+      titles: new SessionTitles(agent, sessionId),
       cwd,
       sessionFingerprint: JSON.stringify({
         cwd,
@@ -8562,6 +8196,7 @@ describe("post-error recovery", () => {
       query: gen as any,
       input,
       cancelled: false,
+      titles: new SessionTitles(agent, "test-session"),
       cwd: "/test",
       sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
       modes: { currentModeId: "default", availableModes: [] },
@@ -12340,6 +11975,7 @@ describe("session/cancel wedge recovery (issue #680)", () => {
       query: gen as any,
       input,
       cancelled: false,
+      titles: new SessionTitles(agent, "test-session"),
       cwd: "/test",
       sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
       modes: { currentModeId: "default", availableModes: [] },
@@ -13776,6 +13412,7 @@ describe("agent selection config option", () => {
         query: gen as any,
         input: new Pushable(),
         cancelled: false,
+        titles: new SessionTitles(agent, sessionId),
         cwd: "/test",
         sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
         modes: { currentModeId: "default", availableModes: [] },

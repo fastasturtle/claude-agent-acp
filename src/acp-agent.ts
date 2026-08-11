@@ -62,7 +62,6 @@ import {
   EffortLevel,
   FastModeDisabledReason,
   FastModeState,
-  getSessionInfo,
   getSessionMessages,
   listSessions,
   McpServerConfig,
@@ -81,7 +80,6 @@ import {
   SDKMessage,
   SDKMessageOrigin,
   SDKPartialAssistantMessage,
-  SDKSessionInfo,
   SDKUserMessage,
   SlashCommand,
   ThinkingConfig,
@@ -98,6 +96,7 @@ import {
   parseGoalRequest,
   toGoalSnapshot,
 } from "./goal-extension.js";
+import { sanitizeTitle, SessionTitles } from "./session-titles.js";
 import { ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { BetaContentBlock, BetaRawContentBlockDelta } from "@anthropic-ai/sdk/resources/beta.mjs";
 import { execFile } from "node:child_process";
@@ -145,58 +144,6 @@ export const CLAUDE_CONFIG_DIR =
   process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude");
 
 const execFileAsync = promisify(execFile);
-
-const MAX_TITLE_LENGTH = 256;
-
-/** How much session text the title is generated from. The CLI caps its own
- *  title input at the same 1000 trailing characters. */
-const MAX_TITLE_CONTEXT_LENGTH = 1000;
-
-/** Below this the generator returns null without calling the model, so there is
- *  nothing to gain by asking yet. */
-const MIN_TITLE_CONTEXT_LENGTH = 10;
-
-/** `generateSessionTitle` is present on the SDK's runtime `Query` class but is
- *  not declared in `sdk.d.ts` (0.3.220), so it is reached through this optional
- *  shape rather than the published interface. */
-type TitleCapableQuery = Query & {
-  generateSessionTitle?: (
-    description: string,
-    options?: { persist?: boolean },
-  ) => Promise<string | null>;
-};
-
-function sanitizeTitle(text: string): string {
-  // Replace newlines and collapse whitespace
-  const sanitized = text
-    .replace(/[\r\n]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-  if (sanitized.length <= MAX_TITLE_LENGTH) {
-    return sanitized;
-  }
-  return sanitized.slice(0, MAX_TITLE_LENGTH - 1) + "…";
-}
-
-/** Rolling text a title is generated from: `previous` plus `text`, keeping only
- *  the trailing {@link MAX_TITLE_CONTEXT_LENGTH} characters. */
-export function appendTitleContext(previous: string | undefined, text: string): string {
-  const next = (previous ?? "") + text;
-  return next.length > MAX_TITLE_CONTEXT_LENGTH ? next.slice(-MAX_TITLE_CONTEXT_LENGTH) : next;
-}
-
-/** Whether a prompt is worth titling a session after. The CLI's own auto-title
- *  path skips slash commands, `!bash` lines and tagged system text; match it, or
- *  sessions end up named "/compact". */
-function isTitleWorthyPrompt(text: string): boolean {
-  const trimmed = text.trim();
-  return trimmed.length > 0 && !/^[/!<]/.test(trimmed);
-}
-
-/** Whether this SDK still offers on-demand title generation. */
-function supportsTitleGeneration(query: Query): boolean {
-  return typeof (query as TitleCapableQuery).generateSessionTitle === "function";
-}
 
 /**
  * Logger interface for customizing logging output
@@ -440,7 +387,7 @@ type Turn = {
   reject: (error: unknown) => void;
 };
 
-type Session = {
+export type Session = {
   query: Query;
   input: Pushable<SDKUserMessage>;
   cancelled: boolean;
@@ -523,6 +470,8 @@ type Session = {
    *  detect when loadSession/resumeSession is called with changed values. */
   sessionFingerprint: string;
   settingsManager: SettingsManager;
+  /** This session's title state and the turn-end logic that maintains it. */
+  titles: SessionTitles;
   accumulatedUsage: AccumulatedUsage;
   modes: SessionModeState;
   models: SessionModelState;
@@ -594,18 +543,6 @@ type Session = {
   /** Accumulated task list for the session, keyed by task ID. Task IDs are
    *  per-session, so this state must not be shared across sessions. */
   taskState: TaskState;
-  /** Last session title we pushed to the client via `session_info_update`, so an
-   *  unchanged title is never re-notified. Undefined until the first push. */
-  lastTitle?: string;
-  /** Rolling tail of this session's own user + assistant text (capped at
-   *  {@link MAX_TITLE_CONTEXT_LENGTH}) that a generated title is derived from.
-   *  Dropped once a title exists. */
-  titleContext?: string;
-  /** Set once this session has a title or has asked for one. A title is
-   *  generated at most once per session: the SDK reports a generated title in
-   *  the same field as a user `/rename`, so re-titling could silently overwrite
-   *  one. Cleared on `conversation_reset`, which is a new topic. */
-  titleSettled?: boolean;
   /** Caches `tool_use` blocks by id so the matching `tool_result` can recover
    *  the tool name/input when mapping it to a `tool_call_update`. Per-session
    *  (tool_use ids are only unique within a session) and pruned at
@@ -1883,139 +1820,6 @@ export class ClaudeAcpAgent {
     };
   }
 
-  /** Read the SDK's stored info for a session. A missing session file or read
-   *  error is non-fatal: the title is best-effort and another turn will retry. */
-  private async readSessionInfo(
-    sessionId: string,
-    session: Session,
-  ): Promise<SDKSessionInfo | undefined> {
-    try {
-      return await getSessionInfo(sessionId, { dir: session.cwd });
-    } catch (error) {
-      this.logger.error(`Session ${sessionId}: failed to read session info: ${error}`);
-      return undefined;
-    }
-  }
-
-  /** Notify the client of a session title, unless it is the one we last sent. */
-  private async publishSessionTitle(
-    sessionId: string,
-    session: Session,
-    rawTitle: string,
-    lastModified: number,
-  ): Promise<void> {
-    const title = sanitizeTitle(rawTitle);
-    if (title === session.lastTitle) {
-      return;
-    }
-    session.lastTitle = title;
-    await this.client.sessionUpdate({
-      sessionId,
-      update: {
-        sessionUpdate: "session_info_update",
-        title,
-        updatedAt: new Date(lastModified).toISOString(),
-      },
-    });
-  }
-
-  /** Turn-end title handling. `idle` is the SDK's turn-over signal, so it is
-   *  when a title may have landed or become generatable.
-   *
-   *  `info.customTitle` is non-empty only once the session file holds a real
-   *  title — a user `/rename` or one generated earlier; the SDK folds both into
-   *  that one field. Adopt it and latch, so neither is ever titled over.
-   *
-   *  With no title yet, ask the SDK to generate one in the background: it is a
-   *  ~2s small-model call and turn-end must not wait on it. Only when that is
-   *  not possible do we fall back to `summary`, which for an SDK-driven session
-   *  is just the raw first prompt. */
-  private async handleTurnEndTitle(sessionId: string, session: Session): Promise<void> {
-    const info = await this.readSessionInfo(sessionId, session);
-
-    if (info?.customTitle) {
-      session.titleSettled = true;
-      session.titleContext = undefined;
-      await this.publishSessionTitle(sessionId, session, info.customTitle, info.lastModified);
-      return;
-    }
-
-    const fallback = info?.summary
-      ? { title: info.summary, lastModified: info.lastModified }
-      : undefined;
-
-    if (this.canRequestSessionTitle(session)) {
-      session.titleSettled = true;
-
-      void this.requestSessionTitle(sessionId, session, fallback).catch((error) => {
-        this.logger.error(`Session ${sessionId}: session title update failed: ${error}`);
-      });
-
-      return;
-    }
-    // Only while this session has no title of its own: `summary` degrades to the
-    // raw first prompt, which must never overwrite a generated title if the
-    // persisted one is slow to show up in `info`.
-    if (fallback && !session.titleSettled) {
-      await this.publishSessionTitle(sessionId, session, fallback.title, fallback.lastModified);
-    }
-  }
-
-  /** Whether to ask the SDK for a generated title now: once per session, on a
-   *  live query, with enough collected text for the generator to work with. */
-  private canRequestSessionTitle(session: Session): boolean {
-    if (session.titleSettled || session.queryClosed || session.cancelled) {
-      return false;
-    }
-    if (!supportsTitleGeneration(session.query)) {
-      return false;
-    }
-    return (session.titleContext?.trim().length ?? 0) >= MIN_TITLE_CONTEXT_LENGTH;
-  }
-
-  /** Generate a title from the session's own text and publish it. `persist`
-   *  writes it to the session file, which is what carries it into
-   *  `session/list` and `session/load`. A null or failed generation releases the
-   *  latch so a later turn retries, and publishes `fallback` (the stored
-   *  summary) so a backend that can't generate titles is no worse off than
-   *  before. */
-  private async requestSessionTitle(
-    sessionId: string,
-    session: Session,
-    fallback: { title: string; lastModified: number } | undefined,
-  ): Promise<void> {
-    const description = session.titleContext?.trim() ?? "";
-    let title: string | null = null;
-
-    try {
-      title =
-        (await (session.query as TitleCapableQuery).generateSessionTitle?.(description, {
-          persist: true,
-        })) ?? null;
-    } catch (error) {
-      this.logger.error(`Session ${sessionId}: failed to generate a session title: ${error}`);
-    }
-
-    // A session torn down or replaced while the title was in flight must not
-    // adopt it.
-    if (this.sessions[sessionId] !== session) {
-      return;
-    }
-
-    // If no title were generated
-    if (!title) {
-      session.titleSettled = false;
-
-      if (fallback) {
-        await this.publishSessionTitle(sessionId, session, fallback.title, fallback.lastModified);
-      }
-      return;
-    }
-
-    session.titleContext = undefined;
-    await this.publishSessionTitle(sessionId, session, title, Date.now());
-  }
-
   async authenticate(_params: AuthenticateRequest): Promise<void> {
     if (_params.methodId === "gateway" || _params.methodId === "gateway-bedrock") {
       this.gatewayAuthRequest = _params as GatewayAuthRequest;
@@ -2184,16 +1988,7 @@ export class ClaudeAcpAgent {
     const isLocalOnlyCommand =
       firstText.startsWith("/") && LOCAL_ONLY_COMMANDS.has(firstText.split(" ", 1)[0]);
 
-    // Collect the user's own text for the session title (see handleTurnEndTitle).
-    if (!session.titleSettled) {
-      const promptText = params.prompt
-        .flatMap((chunk) => (chunk.type === "text" ? [chunk.text] : []))
-        .join("\n");
-
-      if (isTitleWorthyPrompt(promptText)) {
-        session.titleContext = appendTitleContext(session.titleContext, `\n${promptText}\n`);
-      }
-    }
+    session.titles.onPrompt(params.prompt);
 
     // Each prompt is a Turn whose deferred the persistent consumer settles once
     // the turn's outcome is known. `prompt()` owns no loop: it enqueues the
@@ -2466,11 +2261,7 @@ export class ClaudeAcpAgent {
           { parentToolUseId?: string | null } | undefined;
         if (!claudeMeta?.parentToolUseId) {
           session.emittedAssistantText = true;
-          // The assistant's own answer feeds the session title too. Chunks are
-          // appended verbatim so streamed text reassembles.
-          if (!session.titleSettled && update.content.type === "text") {
-            session.titleContext = appendTitleContext(session.titleContext, update.content.text);
-          }
+          session.titles.onAssistantText(update.content);
         }
       }
       await this.client.sessionUpdate(notification);
@@ -3444,8 +3235,8 @@ export class ClaudeAcpAgent {
                     );
                   }
                   // Turn-over is when a title may have landed or become
-                  // generatable; see handleTurnEndTitle.
-                  await this.handleTurnEndTitle(params.sessionId, session);
+                  // generatable; see SessionTitles.onTurnEnd.
+                  await session.titles.onTurnEnd(session);
                 }
                 break;
               }
@@ -4717,9 +4508,7 @@ export class ClaudeAcpAgent {
             // A reset mounts a fresh transcript (`new_conversation_id`), so our
             // cached title no longer describes the session: drop it and
             // re-evaluate at the next turn-end.
-            session.titleSettled = false;
-            session.titleContext = undefined;
-            session.lastTitle = undefined;
+            session.titles.reset();
             break;
           }
           case "tool_use_summary":
@@ -6650,6 +6439,7 @@ export class ClaudeAcpAgent {
       cwd: params.cwd,
       sessionFingerprint: computeSessionFingerprint(params),
       settingsManager,
+      titles: new SessionTitles(this, sessionId),
       accumulatedUsage: {
         inputTokens: 0,
         outputTokens: 0,
