@@ -217,7 +217,10 @@ export class SessionTitles {
    *  latch so a later turn retries, and publishes `fallback` (the stored
    *  summary) so a backend that can't generate titles is no worse off than
    *  before. */
-  private async requestGenerateTitle(session: Session, fallback: TitleFallback | undefined): Promise<void> {
+  private async requestGenerateTitle(
+    session: Session,
+    fallback: TitleFallback | undefined,
+  ): Promise<void> {
     const description = this.context?.trim() ?? "";
     let title: string | null = null;
 
