@@ -50,6 +50,7 @@ import {
   deleteSession,
   getSessionInfo,
   getSessionMessages,
+  PermissionUpdate,
   query,
   SDKAssistantMessage,
 } from "@anthropic-ai/claude-agent-sdk";
@@ -2585,7 +2586,7 @@ describe("permission request cancellation", () => {
     ).rejects.toThrow("Tool use aborted");
   });
 
-  it("offers the approval actions in deny, once, always order with human-readable labels", async () => {
+  it("omits the durable action when Claude supplies no permission update", async () => {
     let request: RequestPermissionRequest | undefined;
     const mockClient = {
       sessionUpdate: async () => {},
@@ -2604,29 +2605,158 @@ describe("permission request cancellation", () => {
     } as any);
 
     expect(request?.options).toEqual([
-      { kind: "reject_once", name: "Deny", optionId: "reject" },
-      { kind: "allow_once", name: "Allow Once", optionId: "allow" },
+      { kind: "allow_once", name: "Allow once", optionId: "allow-once" },
+      { kind: "reject_once", name: "Reject", optionId: "reject" },
+    ]);
+    expect(request?._meta).toBeUndefined();
+  });
+
+  it("maps explicit reject to deny while retaining Claude classification", async () => {
+    const mockClient = {
+      sessionUpdate: async () => {},
+      requestPermission: async () => ({ outcome: { outcome: "selected", optionId: "reject" } }),
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    injectSession(agent, "session-1");
+
+    await expect(
+      agent.canUseTool("session-1")("Bash", { command: "ls" }, {
+        signal: new AbortController().signal,
+        suggestions: [],
+        toolUseID: "tool-1",
+      } as any),
+    ).resolves.toEqual({
+      behavior: "deny",
+      message: "User refused permission to run tool",
+      toolUseID: "tool-1",
+      decisionClassification: "user_reject",
+    });
+  });
+
+  it("maps Claude presentation fields without reconstructing provider text or changing input", async () => {
+    let request: RequestPermissionRequest | undefined;
+    const mockClient = {
+      sessionUpdate: async () => {},
+      requestPermission: async (value: RequestPermissionRequest) => {
+        request = value;
+        return { outcome: { outcome: "selected", optionId: "allow-once" } };
+      },
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    injectSession(agent, "session-1");
+    const input = { file_path: "/outside/a.ts" };
+
+    const result = await agent.canUseTool("session-1")("Read", input, {
+      signal: new AbortController().signal,
+      suggestions: [],
+      toolUseID: "tool-1",
+      requestId: "claude-request-1",
+      title: "Claude wants to read /outside/a.ts",
+      displayName: "Read file",
+      description: "Needed to inspect the dependency.",
+      decisionReason: "This lower-priority reason is ignored.",
+      blockedPath: "/outside/a.ts",
+    });
+
+    expect(request?._meta).toEqual({
+      permission: {
+        version: 1,
+        title: "Claude wants to read /outside/a.ts",
+        description: "Needed to inspect the dependency.",
+      },
+    });
+    expect(request?.toolCall).toMatchObject({
+      kind: "read",
+      rawInput: input,
+      locations: [{ path: "/outside/a.ts", line: 1 }],
+    });
+    expect(request?.toolCall.rawInput).toBe(input);
+    expect(result?.behavior === "allow" && result.updatedInput).toBe(input);
+  });
+
+  it("keeps concurrent permission requests independent even for the same tool call", async () => {
+    const requests: RequestPermissionRequest[] = [];
+    const mockClient = {
+      sessionUpdate: async () => {},
+      requestPermission: async (request: RequestPermissionRequest) => {
+        requests.push(request);
+        return { outcome: { outcome: "selected", optionId: "allow-once" } };
+      },
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    const session = injectSession(agent, "session-1");
+    session.emittedToolCalls.add("tool-shared");
+
+    const canUseTool = agent.canUseTool("session-1");
+    await Promise.all([
+      canUseTool("Bash", { command: "one" }, {
+        signal: new AbortController().signal,
+        suggestions: [],
+        toolUseID: "tool-shared",
+      } as any),
+      canUseTool("Bash", { command: "two" }, {
+        signal: new AbortController().signal,
+        suggestions: [],
+        toolUseID: "tool-shared",
+      } as any),
+    ]);
+
+    expect(requests).toHaveLength(2);
+    expect(requests.map((request) => request.toolCall.rawInput)).toEqual([
+      { command: "one" },
+      { command: "two" },
+    ]);
+  });
+
+  it("applies the exact persistent and directory updates described by the selected option", async () => {
+    let request: RequestPermissionRequest | undefined;
+    const updates: PermissionUpdate[] = [
       {
-        kind: "allow_always",
-        name: "Always Allow",
-        optionId: "allow_always",
-        _meta: {
-          permission: {
-            version: 1,
-            changes: [
-              {
-                type: "policy_rule",
-                operation: "add",
-                ruleBehavior: "allow",
-                description: "Allow all Bash calls",
-                lifetime: { scope: "session" },
-                targets: [{ type: "tool", toolName: "Bash" }],
-              },
-            ],
-          },
+        type: "addRules",
+        rules: [{ toolName: "Bash", ruleContent: "npm test:*" }],
+        behavior: "allow",
+        destination: "userSettings",
+      },
+      {
+        type: "addDirectories",
+        directories: ["/tmp/work"],
+        destination: "projectSettings",
+      },
+    ];
+    const mockClient = {
+      sessionUpdate: async () => {},
+      requestPermission: async (params: RequestPermissionRequest) => {
+        request = params;
+        return { outcome: { outcome: "selected", optionId: "allow-with-updates" } };
+      },
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    injectSession(agent, "session-1");
+
+    const result = await agent.canUseTool("session-1")("Bash", { command: "npm test" }, {
+      signal: new AbortController().signal,
+      suggestions: updates,
+      toolUseID: "tool-1",
+    } as any);
+
+    expect(result?.behavior).toBe("allow");
+    if (!result || result.behavior !== "allow") throw new Error("expected allow result");
+    expect(result.updatedPermissions).toEqual(updates);
+    const option = request?.options.find(
+      (candidate) => candidate.optionId === "allow-with-updates",
+    );
+    expect(option).toEqual({
+      kind: "allow_always",
+      name: "Allow and update permissions",
+      optionId: "allow-with-updates",
+      _meta: {
+        permission: {
+          version: 1,
+          description:
+            "Allow Bash calls matching “npm test:*” persistently in user settings. Add filesystem access to /tmp/work persistently in shared project settings.",
         },
       },
-    ]);
+    });
   });
 
   it("attaches structured permission changes to the always-allow ACP option", async () => {
@@ -2659,42 +2789,13 @@ describe("permission request cancellation", () => {
       toolUseID: "tool-1",
     } as any);
 
-    expect(request?.options.find((option) => option.optionId === "allow_always")?._meta).toEqual({
+    expect(
+      request?.options.find((option) => option.optionId === "allow-with-updates")?._meta,
+    ).toEqual({
       permission: {
         version: 1,
-        changes: [
-          {
-            type: "policy_rule",
-            operation: "add",
-            ruleBehavior: "allow",
-            description: "Allow Bash calls matching npm test:*",
-            lifetime: { scope: "session" },
-            targets: [
-              {
-                type: "tool",
-                toolName: "Bash",
-                matcher: {
-                  type: "provider_rule",
-                  provider: "claudeCode",
-                  value: "npm test:*",
-                },
-              },
-            ],
-          },
-          {
-            type: "policy_rule",
-            operation: "add",
-            ruleBehavior: "allow",
-            description: "Allow filesystem access under /tmp/work",
-            lifetime: { scope: "session" },
-            targets: [
-              {
-                type: "filesystem",
-                matcher: { type: "directory", path: "/tmp/work" },
-              },
-            ],
-          },
-        ],
+        description:
+          "Allow Bash calls matching “npm test:*” for the current Claude session. Add filesystem access to /tmp/work for the current Claude session.",
       },
     });
   });
@@ -2735,49 +2836,13 @@ describe("permission request cancellation", () => {
     } as any);
 
     expect(
-      (request?.options.find((option) => option.optionId === "allow_always")?._meta as any)
-        ?.permission.changes,
-    ).toEqual([
-      {
-        type: "policy_rule",
-        operation: "replace",
-        ruleBehavior: "deny",
-        description: "Replace deny rules with Bash calls matching rm generated.txt",
-        lifetime: { scope: "persistent", storage: "project" },
-        targets: [
-          {
-            type: "tool",
-            toolName: "Bash",
-            matcher: {
-              type: "provider_rule",
-              provider: "claudeCode",
-              value: "rm generated.txt",
-            },
-          },
-        ],
-      },
-      {
-        type: "policy_rule",
-        operation: "remove",
-        ruleBehavior: "allow",
-        description: "Remove additional filesystem access under /tmp/old",
-        lifetime: { scope: "persistent", storage: "project_local" },
-        targets: [
-          {
-            type: "filesystem",
-            matcher: { type: "directory", path: "/tmp/old" },
-          },
-        ],
-      },
-      {
-        type: "permission_mode",
-        operation: "set",
-        provider: "claudeCode",
-        mode: "default",
-        description: "Set Claude Code permission mode to default",
-        lifetime: { scope: "session" },
-      },
-    ]);
+      (request?.options.find((option) => option.optionId === "allow-with-updates")?._meta as any)
+        ?.permission,
+    ).toEqual({
+      version: 1,
+      description:
+        "Replace deny rules with Bash calls matching “rm generated.txt” persistently in shared project settings. Remove filesystem access to /tmp/old persistently in local-project settings. Set Claude permission mode to default for the current Claude session.",
+    });
   });
 });
 
@@ -2797,7 +2862,7 @@ describe("tool_call emitted before permission request", () => {
       },
       requestPermission: async () => {
         events.push("permission");
-        return { outcome: { outcome: "selected", optionId: "allow" } };
+        return { outcome: { outcome: "selected", optionId: "allow-once" } };
       },
     } as unknown as AcpClient;
     const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
@@ -3081,7 +3146,7 @@ describe("canUseTool in bypassPermissions mode", () => {
       sessionUpdate: async () => {},
       requestPermission: async () => {
         events.push("permission");
-        return { outcome: { outcome: "selected", optionId: "allow" } };
+        return { outcome: { outcome: "selected", optionId: "allow-once" } };
       },
     } as unknown as AcpClient;
     const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
@@ -3104,7 +3169,20 @@ describe("canUseTool in bypassPermissions mode", () => {
     } as any);
 
     expect(events).toEqual([]);
-    expect(result).toMatchObject({ behavior: "allow" });
+    expect(result).toEqual({
+      behavior: "allow",
+      updatedInput: { command: "ls" },
+      toolUseID: "tool-1",
+    });
+
+    agent.sessions["session-1"]!.modes.currentModeId = "default";
+    agent.sessions["session-1"]!.emittedToolCalls.add("tool-2");
+    await agent.canUseTool("session-1")("Bash", { command: "ls" }, {
+      signal: new AbortController().signal,
+      suggestions: [],
+      toolUseID: "tool-2",
+    } as any);
+    expect(events).toEqual(["permission"]);
   });
 
   // The asks that still reach canUseTool in bypass mode are the ones the CLI
@@ -3129,6 +3207,35 @@ describe("canUseTool in bypassPermissions mode", () => {
     expect(events).toEqual(["permission"]);
     expect(result).toMatchObject({ behavior: "allow" });
   });
+
+  it("does not promise an ineffective always-allow fallback for a forced ask rule", async () => {
+    let request: RequestPermissionRequest | undefined;
+    const mockClient = {
+      sessionUpdate: async () => {},
+      requestPermission: async (params: RequestPermissionRequest) => {
+        request = params;
+        return { outcome: { outcome: "selected", optionId: "allow-once" } };
+      },
+    } as unknown as AcpClient;
+    const agent = new ClaudeAcpAgent(mockClient, { log: () => {}, error: () => {} });
+    agent.sessions["session-1"] = mockSessionState({
+      modes: { currentModeId: "bypassPermissions", availableModes: [] },
+    });
+    agent.sessions["session-1"]!.emittedToolCalls.add("tool-1");
+
+    await agent.canUseTool("session-1")("Bash", { command: "terraform destroy" }, {
+      signal: new AbortController().signal,
+      suggestions: [],
+      toolUseID: "tool-1",
+      matchedAskRule: {
+        source: "projectSettings",
+        toolName: "Bash",
+        ruleContent: "Bash(terraform:*)",
+      },
+    } as any);
+
+    expect(request?.options.map((option) => option.optionId)).toEqual(["allow-once", "reject"]);
+  });
 });
 
 describe("subagent permission attribution (issue #851)", () => {
@@ -3148,7 +3255,7 @@ describe("subagent permission attribution (issue #851)", () => {
       },
       requestPermission: async (params: RequestPermissionRequest) => {
         requests.push(params);
-        return { outcome: { outcome: "selected", optionId: "allow" } };
+        return { outcome: { outcome: "selected", optionId: "allow-once" } };
       },
     } as unknown as AcpClient;
     const agent = new ClaudeAcpAgent(mockClient, { log, error: () => {} });

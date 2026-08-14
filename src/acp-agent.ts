@@ -27,7 +27,6 @@ import {
   ndJsonStream,
   NewSessionRequest,
   NewSessionResponse,
-  PermissionOption,
   PromptRequest,
   PromptResponse,
   ProviderInfo,
@@ -73,7 +72,6 @@ import {
   Options,
   PermissionMode,
   PermissionResult,
-  PermissionUpdate,
   Query,
   query,
   SDKAssistantMessageError,
@@ -120,6 +118,10 @@ import {
   refusalFallbackResultFromResponse,
   refusalFallbackToCreateRequest,
 } from "./elicitation.js";
+import { normalizeDurablePermissionChangeSet } from "./permission-normalization.js";
+import { buildClaudePermissionOptions } from "./permission-options.js";
+import { buildClaudePermissionPresentation } from "./permission-presentation.js";
+import { mapClaudePermissionResponse } from "./permission-response.js";
 import { SettingsManager } from "./settings.js";
 import {
   activeUsageLimitMessage,
@@ -1272,124 +1274,6 @@ export function resolvePermissionMode(
   }
 
   return mapped;
-}
-
-function permissionLifetime(destination: PermissionUpdate["destination"]): Record<string, string> {
-  switch (destination) {
-    case "session":
-      return { scope: "session" };
-    case "cliArg":
-      return { scope: "process", storage: "cli_argument" };
-    case "userSettings":
-      return { scope: "persistent", storage: "user" };
-    case "projectSettings":
-      return { scope: "persistent", storage: "project" };
-    case "localSettings":
-      return { scope: "persistent", storage: "project_local" };
-    default:
-      return { scope: "unknown" };
-  }
-}
-
-function permissionMetadataForAlwaysAllow(
-  suggestions: PermissionUpdate[] | undefined,
-  toolName: string,
-): Record<string, unknown> {
-  const effectiveSuggestions =
-    suggestions && suggestions.length > 0
-      ? suggestions
-      : [
-          {
-            type: "addRules" as const,
-            rules: [{ toolName }],
-            behavior: "allow" as const,
-            destination: "session" as const,
-          },
-        ];
-  const changes: Array<Record<string, unknown>> = [];
-
-  for (const update of effectiveSuggestions) {
-    switch (update.type) {
-      case "addRules":
-      case "removeRules":
-      case "replaceRules": {
-        const operation =
-          update.type === "addRules" ? "add" : update.type === "removeRules" ? "remove" : "replace";
-        const targets = update.rules.map((rule) => ({
-          type: "tool",
-          toolName: rule.toolName,
-          ...(rule.ruleContent
-            ? {
-                matcher: {
-                  type: "provider_rule",
-                  provider: "claudeCode",
-                  value: rule.ruleContent,
-                },
-              }
-            : {}),
-        }));
-        const renderedRules = update.rules
-          .map((rule) =>
-            rule.ruleContent
-              ? `${rule.toolName} calls matching ${rule.ruleContent}`
-              : `all ${rule.toolName} calls`,
-          )
-          .join(", ");
-        const verb =
-          operation === "add"
-            ? update.behavior === "allow"
-              ? "Allow"
-              : update.behavior === "deny"
-                ? "Deny"
-                : "Ask before"
-            : operation === "remove"
-              ? `Remove ${update.behavior} rules for`
-              : `Replace ${update.behavior} rules with`;
-        changes.push({
-          type: "policy_rule",
-          operation,
-          ruleBehavior: update.behavior,
-          description: `${verb} ${renderedRules}`,
-          lifetime: permissionLifetime(update.destination),
-          targets,
-        });
-        break;
-      }
-      case "addDirectories":
-      case "removeDirectories": {
-        const operation = update.type === "addDirectories" ? "add" : "remove";
-        changes.push({
-          type: "policy_rule",
-          operation,
-          ruleBehavior: "allow",
-          description:
-            operation === "add"
-              ? `Allow filesystem access under ${update.directories.join(", ")}`
-              : `Remove additional filesystem access under ${update.directories.join(", ")}`,
-          lifetime: permissionLifetime(update.destination),
-          targets: update.directories.map((path) => ({
-            type: "filesystem",
-            matcher: { type: "directory", path },
-          })),
-        });
-        break;
-      }
-      case "setMode":
-        changes.push({
-          type: "permission_mode",
-          operation: "set",
-          provider: "claudeCode",
-          mode: update.mode,
-          description: `Set Claude Code permission mode to ${update.mode}`,
-          lifetime: permissionLifetime(update.destination),
-        });
-        break;
-      default:
-        break;
-    }
-  }
-
-  return { version: 1, changes };
 }
 
 /**
@@ -5254,7 +5138,18 @@ export class ClaudeAcpAgent {
     return async (
       toolName,
       toolInput,
-      { signal, suggestions, toolUseID, agentID, matchedAskRule },
+      {
+        signal,
+        suggestions,
+        toolUseID,
+        agentID,
+        matchedAskRule,
+        blockedPath,
+        decisionReason,
+        title,
+        displayName,
+        description,
+      },
     ) => {
       const supportsTerminalOutput = this.clientCapabilities?._meta?.["terminal_output"] === true;
       const session = this.sessions[sessionId];
@@ -5302,94 +5197,6 @@ export class ClaudeAcpAgent {
         return this.handleAskUserQuestion(sessionId, toolInput, toolUseID, signal);
       }
 
-      if (toolName === "ExitPlanMode") {
-        const optionsAll: PermissionOption[] = [
-          { kind: "allow_always", name: 'Yes, and use "auto" mode', optionId: "auto" },
-          {
-            kind: "allow_always",
-            name: "Yes, and auto-accept edits",
-            optionId: "acceptEdits",
-          },
-          { kind: "allow_once", name: "Yes, and manually approve edits", optionId: "default" },
-          { kind: "reject_once", name: "No, keep planning", optionId: "plan" },
-        ];
-        if (ALLOW_BYPASS) {
-          optionsAll.unshift({
-            kind: "allow_always",
-            name: "Yes, and bypass permissions",
-            optionId: "bypassPermissions",
-          });
-        }
-        // Filter against the session's currently-advertised modes so we never
-        // present options the active model can't honor (e.g. `auto` on Haiku).
-        // `bypassPermissions` is already covered by `availableModes` via
-        // `buildAvailableModes`/`ALLOW_BYPASS`. The `plan` option is a
-        // "keep planning" reject path; it's always present in `availableModes`.
-        const options = optionsAll.filter((o) =>
-          session.modes.availableModes.some((m) => m.id === o.optionId),
-        );
-
-        const response = await this.requestPermissionFromClient(
-          {
-            options,
-            sessionId,
-            toolCall: {
-              toolCallId: toolUseID,
-              rawInput: toolInput,
-              ...toolInfoFromToolUse(
-                { name: toolName, input: toolInput, id: toolUseID },
-                supportsTerminalOutput,
-                session?.cwd,
-              ),
-              // `claudeCode` metas always carry `toolName` (see ToolUpdateMeta),
-              // so clients can rely on one shape everywhere.
-              ...(parentToolUseId
-                ? { _meta: { claudeCode: { toolName, parentToolUseId } } satisfies ToolUpdateMeta }
-                : {}),
-            },
-          },
-          toolName,
-          signal,
-          parentToolUseId,
-        );
-
-        if (signal.aborted || response.outcome?.outcome === "cancelled") {
-          throw new Error("Tool use aborted");
-        }
-        const selectedMode =
-          response.outcome?.outcome === "selected" ? response.outcome.optionId : undefined;
-        const selectedModeWasOffered = options.some((option) => option.optionId === selectedMode);
-        if (
-          selectedModeWasOffered &&
-          (selectedMode === "default" ||
-            selectedMode === "acceptEdits" ||
-            selectedMode === "auto" ||
-            selectedMode === "bypassPermissions")
-        ) {
-          await this.client.sessionUpdate({
-            sessionId,
-            update: {
-              sessionUpdate: "current_mode_update",
-              currentModeId: selectedMode,
-            },
-          });
-          await this.updateConfigOption(sessionId, MODE_CONFIG_ID, selectedMode);
-
-          return {
-            behavior: "allow",
-            updatedInput: toolInput,
-            updatedPermissions: suggestions ?? [
-              { type: "setMode", mode: selectedMode, destination: "session" },
-            ],
-          };
-        } else {
-          return {
-            behavior: "deny",
-            message: "User rejected request to exit plan mode.",
-          };
-        }
-      }
-
       // In bypass mode the CLI skips permission checks itself; the asks that
       // still reach canUseTool are the ones it insists on prompting for even
       // under --dangerously-skip-permissions. Keep auto-allowing those —
@@ -5401,78 +5208,44 @@ export class ClaudeAcpAgent {
         return {
           behavior: "allow",
           updatedInput: toolInput,
-          updatedPermissions: suggestions ?? [
-            { type: "addRules", rules: [{ toolName }], behavior: "allow", destination: "session" },
-          ],
+          toolUseID,
         };
+      }
+
+      const durableChangeSet = normalizeDurablePermissionChangeSet(
+        suggestions,
+        matchedAskRule !== undefined,
+      );
+      const presentation = buildClaudePermissionPresentation({
+        toolName,
+        input: toolInput,
+        toolUseID,
+        cwd: session.cwd,
+        supportsTerminalOutput,
+        blockedPath,
+        title,
+        displayName,
+        description,
+        decisionReason,
+      });
+      if (parentToolUseId) {
+        presentation.toolCall._meta = {
+          claudeCode: { toolName, parentToolUseId },
+        } satisfies ToolUpdateMeta;
       }
 
       const response = await this.requestPermissionFromClient(
         {
-          options: [
-            { kind: "reject_once", name: "Deny", optionId: "reject" },
-            { kind: "allow_once", name: "Allow Once", optionId: "allow" },
-            {
-              kind: "allow_always",
-              name: "Always Allow",
-              optionId: "allow_always",
-              _meta: {
-                permission: permissionMetadataForAlwaysAllow(suggestions, toolName),
-              },
-            },
-          ],
+          ...presentation,
+          options: buildClaudePermissionOptions(durableChangeSet),
           sessionId,
-          toolCall: {
-            toolCallId: toolUseID,
-            rawInput: toolInput,
-            ...toolInfoFromToolUse(
-              { name: toolName, input: toolInput, id: toolUseID },
-              supportsTerminalOutput,
-              session?.cwd,
-            ),
-            // `claudeCode` metas always carry `toolName` (see ToolUpdateMeta),
-            // so clients can rely on one shape everywhere.
-            ...(parentToolUseId
-              ? { _meta: { claudeCode: { toolName, parentToolUseId } } satisfies ToolUpdateMeta }
-              : {}),
-          },
         },
         toolName,
         signal,
         parentToolUseId,
       );
-      if (signal.aborted || response.outcome?.outcome === "cancelled") {
-        throw new Error("Tool use aborted");
-      }
-      if (
-        response.outcome?.outcome === "selected" &&
-        (response.outcome.optionId === "allow" || response.outcome.optionId === "allow_always")
-      ) {
-        // If Claude Code has suggestions, it will update their settings already
-        if (response.outcome.optionId === "allow_always") {
-          return {
-            behavior: "allow",
-            updatedInput: toolInput,
-            updatedPermissions: suggestions ?? [
-              {
-                type: "addRules",
-                rules: [{ toolName }],
-                behavior: "allow",
-                destination: "session",
-              },
-            ],
-          };
-        }
-        return {
-          behavior: "allow",
-          updatedInput: toolInput,
-        };
-      } else {
-        return {
-          behavior: "deny",
-          message: "User refused permission to run tool",
-        };
-      }
+      if (signal.aborted) throw new Error("Tool use aborted");
+      return mapClaudePermissionResponse(response, toolInput, toolUseID, durableChangeSet);
     };
   }
 
