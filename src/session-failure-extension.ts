@@ -323,6 +323,13 @@ export class SessionFailureController {
     }
   }
 
+  hasActiveKind(kind: ClaudeFailureKind): boolean {
+    for (const failure of this.state.active.values()) {
+      if (failure.kind === kind) return true;
+    }
+    return false;
+  }
+
   recordActive(failure: PublishedSessionFailure): void {
     this.state.revisions.set(failure.id, failure.revision);
     this.state.active.set(failure.id, failure);
