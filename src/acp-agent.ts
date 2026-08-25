@@ -95,6 +95,21 @@ import {
   toGoalSnapshot,
 } from "./goal-extension.js";
 import { sanitizeTitle, SessionTitles } from "./session-titles.js";
+import {
+  AUTH_STATUS_METHOD,
+  AUTH_STATUS_UPDATE_METHOD,
+  type AuthStatus,
+  type AuthStatusRequest,
+  type AuthStatusResponse,
+  authStatusCapability,
+  authStatusResponse,
+  fromAccountInfo,
+  fromCliStatus,
+  gatewayAuthStatus,
+  mergeAuthStatus,
+  notLoggedInAuthStatus,
+  parseAuthStatusRequest,
+} from "./auth-status.js";
 import { ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { BetaContentBlock, BetaRawContentBlockDelta } from "@anthropic-ai/sdk/resources/beta.mjs";
 import { execFile } from "node:child_process";
@@ -1382,6 +1397,21 @@ export class ClaudeAcpAgent {
   /** Serializes provider changes while every open query is recreated between turns. */
   private providerUpdate: Promise<void> | null = null;
   private readonly exitPlan: ExitPlanCoordinator<Session, Turn>;
+  /** Last auth identity reported to the client, connection-scoped like
+   *  `authenticate`/`logout`. Undefined means "not determined yet". */
+  currentAuthStatus?: AuthStatus;
+  /** In-flight `claude auth status --json` probe, shared by every caller so
+   *  concurrent `initialize` + `auth/status` never spawn two CLI processes. */
+  private cliAuthProbe: Promise<AuthStatus | undefined> | null = null;
+  /** Counts auth-affecting events (`authenticate`, `logout`) on this
+   *  connection. A probe records it at start and publishes only if it has not
+   *  moved, so a slow read can never overwrite a newer login or logout. */
+  private authEpoch = 0;
+  /** Keeps the "session account told us nothing" note to one line per process
+   *  instead of one per session. */
+  private loggedUninformativeAccount = false;
+  /** Same, for the "client provider override active" note. */
+  private loggedOverriddenAccount = false;
   /** Grace period before a `session/cancel` forces a wedged prompt loop to
    *  return "cancelled". See {@link DEFAULT_FORCE_CANCEL_GRACE_MS}. Mutable so
    *  tests can shrink it. */
@@ -1436,6 +1466,12 @@ export class ClaudeAcpAgent {
 
   async initialize(request: InitializeRequest): Promise<InitializeResponse> {
     this.clientCapabilities = request.clientCapabilities;
+
+    // Learn the auth identity in the background: `initialize` never waits on
+    // the CLI probe, and no snapshot rides in its response. When the probe
+    // lands it calls `setAuthStatus`, which pushes `auth/status_update`; a
+    // client that asks earlier gets the same probe awaited via `auth/status`.
+    void this.probeCliAuthStatus();
 
     // Bypasses standard auth by routing requests through a custom Anthropic-protocol gateway.
     // Only offered when the client advertises `auth._meta.gateway` capability.
@@ -1551,6 +1587,11 @@ export class ClaudeAcpAgent {
           claudeCode: {
             promptQueueing: true,
           },
+          // Capability marker for the `authStatus` extension: presence means
+          // "supported" and the object stays empty — it is never a status
+          // payload. The state itself is pulled with `auth/status` and pushed
+          // with `auth/status_update`.
+          authStatus: authStatusCapability(),
         },
         promptCapabilities: {
           image: true,
@@ -1683,9 +1724,132 @@ export class ClaudeAcpAgent {
   async authenticate(_params: AuthenticateRequest): Promise<void> {
     if (_params.methodId === "gateway" || _params.methodId === "gateway-bedrock") {
       this.gatewayAuthRequest = _params as GatewayAuthRequest;
+      // The gateway holds the credentials from here on, so it replaces
+      // whatever the CLI store reported. Bumping the epoch discards any probe
+      // that started before this login: its answer is now stale.
+      this.authEpoch += 1;
+      this.setAuthStatus(
+        gatewayAuthStatus(gatewayRequestToProviderConfig(this.gatewayAuthRequest)?.baseUrl),
+      );
       return;
     }
     throw new Error("Method not implemented.");
+  }
+
+  /**
+   * `auth/status` — pull the connection's auth identity.
+   *
+   * The pull is the client's "re-check now": it triggers a read of the
+   * credential source — joining the in-flight CLI probe or starting one — and,
+   * once that settles, answers the connection's last known state. A login or
+   * logout performed in an unrelated terminal would otherwise stay invisible
+   * until the next session create. The answer therefore costs probe latency;
+   * contract-sanctioned, the client owns its timeout.
+   *
+   * Answering from the last known state is not a cache: everything a read is
+   * allowed to report reaches that state through {@link setAuthStatus} before
+   * this resumes. A valid read published its (merged) result, so the last known
+   * state IS that read. A read an `authenticate`/`logout` invalidated published
+   * nothing, so the last known state is the newer one that event established.
+   * A read that failed published nothing either, leaving whatever a session
+   * already taught us — or nothing, which answers `{}`. The invariant "never
+   * older than the last `auth/status_update` sent" thus falls out of the
+   * publish path, with no extra bookkeeping, and gateway auth — whose
+   * credentials the CLI store cannot see — is answered from that same record.
+   */
+  async authStatus(_params: AuthStatusRequest): Promise<AuthStatusResponse> {
+    await this.probeCliAuthStatus();
+    return authStatusResponse(this.currentAuthStatus);
+  }
+
+  /**
+   * Stores `next` and pushes it to the client. Every assignment publishes:
+   * clients replace their whole state on each update and tolerate duplicates,
+   * so the agent does no suppression of its own. What the agent does owe is
+   * truth — a stale or uninformative source must not reach here at all (see
+   * the epoch check in the probe and the guards at session create).
+   */
+  setAuthStatus(next: AuthStatus | undefined): void {
+    if (!next) {
+      return;
+    }
+    this.currentAuthStatus = next;
+    // ACP notifications get no reply, and clients that do not know the method
+    // drop it silently — send unconditionally and never fail a caller on it.
+    void Promise.resolve()
+      .then(() => this.client.extNotification(AUTH_STATUS_UPDATE_METHOD, { authStatus: next }))
+      .catch((error) => {
+        this.logger.error("Failed to send auth/status_update:", error);
+      });
+  }
+
+  /** Shares one in-flight `claude auth status --json` run between callers. The
+   *  promise is released once settled so a later call re-probes instead of
+   *  replaying a stale verdict. `fresh` forces a new run even when one is in
+   *  flight — `logout` needs a read that started after the credentials were
+   *  cleared. */
+  private probeCliAuthStatus(options?: { fresh?: boolean }): Promise<AuthStatus | undefined> {
+    if (!options?.fresh && this.cliAuthProbe) {
+      return this.cliAuthProbe;
+    }
+    const probe = this.runCliAuthProbe();
+    this.cliAuthProbe = probe;
+    void probe.finally(() => {
+      if (this.cliAuthProbe === probe) {
+        this.cliAuthProbe = null;
+      }
+    });
+    return probe;
+  }
+
+  /** Never rejects: an unavailable CLI means "not reported", not an error. */
+  private async runCliAuthProbe(): Promise<AuthStatus | undefined> {
+    // Monotonicity: a read that started before the connection's latest
+    // auth-affecting event describes a world that no longer exists. Remember
+    // which one this read belongs to and drop the answer if it moved on.
+    const epoch = this.authEpoch;
+    // ACP gateway auth bypasses the CLI credential store entirely, so the
+    // probe would report an identity that is not the one being used. A mere
+    // client provider override (`providers/set`) does NOT skip the probe: it
+    // reroutes traffic without touching the credential store, and the store is
+    // exactly the agent-owned login `authStatus` reports.
+    if (this.gatewayAuthRequest) {
+      return this.currentAuthStatus;
+    }
+    let stdout: string;
+    try {
+      const cliPath = await claudeCliPath();
+      ({ stdout } = await execFileAsync(cliPath, ["auth", "status", "--json"]));
+    } catch (error) {
+      // The logged-out case exits 1 while still printing valid JSON, so the
+      // stdout of a failed exec is parsed just like a successful one.
+      const failed = error as { stdout?: unknown } | null;
+      if (typeof failed?.stdout !== "string" || failed.stdout.trim().length === 0) {
+        this.logger.error(
+          "claude auth status failed:",
+          error instanceof Error ? error.message : String(error),
+        );
+        return undefined;
+      }
+      stdout = failed.stdout;
+    }
+    const status = fromCliStatus(stdout);
+    if (!status) {
+      this.logger.error("claude auth status returned unparseable output");
+      return undefined;
+    }
+    if (epoch !== this.authEpoch) {
+      // An `authenticate` or `logout` landed while this probe was running; the
+      // newer state wins and this answer is discarded, never published.
+      this.logger.log("[auth/status] discarding a probe that predates the latest auth change");
+      return this.currentAuthStatus;
+    }
+    // The CLI probe can be poorer than the session `AccountInfo` for the very
+    // same login (no organization, say). Keep those extra fields rather than
+    // regressing the payload; a different identity replaces it wholesale.
+    const merged = mergeAuthStatus(this.currentAuthStatus, status);
+    this.setAuthStatus(merged);
+    return merged;
   }
 
   async unstable_listProviders(_params: ListProvidersRequest): Promise<ListProvidersResponse> {
@@ -1810,6 +1974,9 @@ export class ClaudeAcpAgent {
     // those paths.
     this.gatewayAuthRequest = undefined;
     this.providerConfig = undefined;
+    // Any probe already running read the pre-logout world; the bump makes its
+    // answer unpublishable so it cannot resurrect the identity being cleared.
+    this.authEpoch += 1;
     // Learned context windows are per-account state too: 1M-context
     // entitlement is gated per org/tier, and an OAuth re-login is invisible to
     // the env-derived provider cache key, so windows learned under the old
@@ -1832,6 +1999,15 @@ export class ClaudeAcpAgent {
         { stderr: stderr || undefined },
         `claude auth logout failed: ${error instanceof Error ? error.message : String(error)}`,
       );
+    }
+
+    // Re-read the store rather than assuming "none": an API key from the env
+    // or a key helper survives `auth logout`. The read must start after the
+    // credentials were cleared, so it never joins a probe that is already in
+    // flight. If it can't be read, the logout still happened — drop the
+    // now-stale identity instead of reporting it further.
+    if (!(await this.probeCliAuthStatus({ fresh: true }))) {
+      this.setAuthStatus(notLoggedInAuthStatus());
     }
   }
 
@@ -6352,6 +6528,41 @@ export class ClaudeAcpAgent {
       );
     }
 
+    // Lazy identity upgrade: `AccountInfo` is richer than the CLI probe (it is
+    // what the live query actually authenticates with). Reported regardless of
+    // `--hide-claude-auth`: that flag blocks the use of a subscription, it does
+    // not make the state secret. Two cases skip it:
+    //
+    // - ACP gateway *authentication* (`gatewayAuthRequest`): the gateway, not
+    //   this account, is the agent-owned identity — already reported as
+    //   `kind: "gateway"` by `authenticate`.
+    // - A client-driven provider override (`providers/set`): the session then
+    //   routes through the client's endpoint and `AccountInfo` describes that
+    //   route (e.g. `apiProvider: "gateway"`), which is NOT agent-owned state.
+    //   `authStatus` reports the agent's own login only, so the CLI probe —
+    //   which reads the credential store the override never touches — stays
+    //   authoritative.
+    //
+    // An account with no identity signal (e.g. `{apiProvider: "firstParty"}`
+    // under an apiKeyHelper) means "nothing to add", not "logged out" — keep
+    // what the CLI probe already established instead of overwriting it.
+    if (this.providerConfig) {
+      if (!this.loggedOverriddenAccount) {
+        this.loggedOverriddenAccount = true;
+        this.logger.log(
+          "[auth/status] client provider override active; keeping agent-owned probe state",
+        );
+      }
+    } else if (!this.gatewayAuthRequest) {
+      const fromSession = fromAccountInfo(initializationResult.account);
+      if (fromSession) {
+        this.setAuthStatus(fromSession);
+      } else if (!this.loggedUninformativeAccount) {
+        this.loggedUninformativeAccount = true;
+        this.logger.log("[auth/status] session account carries no identity signal; keeping probe");
+      }
+    }
+
     // Apply user's `availableModels` allowlist from settings.json before any
     // downstream model handling. The SDK only enforces this allowlist in its
     // own UI, not in `initializationResult.models`, so we filter here to keep
@@ -8506,6 +8717,11 @@ export function runAcp(logger?: Logger) {
     .onNotification(methods.agent.session.cancel, (ctx) => agent.cancel(ctx.params))
     .onRequest<SteerRequest, SteerResponse>(STEER_METHOD, { parse: parseSteerRequest }, (ctx) =>
       agent.steer(ctx.params),
+    )
+    .onRequest<AuthStatusRequest, AuthStatusResponse>(
+      AUTH_STATUS_METHOD,
+      { parse: parseAuthStatusRequest },
+      (ctx) => agent.authStatus(ctx.params),
     )
     .onRequest<GoalRequest, GoalControlResponse>(
       GOAL_CONTROL_METHOD,

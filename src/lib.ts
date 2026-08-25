@@ -18,6 +18,18 @@ export {
   toolUpdateFromToolResult,
 } from "./tools.js";
 export { SettingsManager, type SettingsManagerOptions } from "./settings.js";
+// The `authStatus` extension's wire surface: the two method names and the
+// payload types needed to read the traffic. The mappers stay internal.
+export {
+  AUTH_STATUS_METHOD,
+  AUTH_STATUS_UPDATE_METHOD,
+  type AuthStatus,
+  type AuthStatusAccount,
+  type AuthStatusKind,
+  type AuthStatusRequest,
+  type AuthStatusResponse,
+  type AuthStatusUpdateNotification,
+} from "./auth-status.js";
 
 // Export types
 export type { ClaudePlanEntry } from "./tools.js";
